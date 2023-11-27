@@ -1,5 +1,6 @@
 .nfs*
 sa1b
+logs/
 
 # compilation and distribution
 __pycache__

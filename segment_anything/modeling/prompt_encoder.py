@@ -117,7 +117,12 @@ class PromptEncoder(nn.Module):
         if points is not None:
             return points[0].shape[0]
         elif boxes is not None:
-            return boxes.shape[0]
+            if boxes.ndim == 2:
+                return boxes.shape[0]
+            elif boxes.ndim == 3:
+                return boxes.shape[0] * boxes.shape[1]
+            else:
+                raise NotImplementedError(" Box shape {} not accepted".format(boxes.shape))
         elif masks is not None:
             return masks.shape[0]
         else:
