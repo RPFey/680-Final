@@ -166,16 +166,16 @@ class Sam(nn.Module):
                 to subsequent iterations of prediction.
         """
         # Normalize colors
-        input_images = (input_images - self.pixel_mean.view(1, -1, 1, 1)) / self.pixel_std.view(1, -1, 1, 1)
+        postprcess_images = (input_images - self.pixel_mean.view(1, -1, 1, 1)) / self.pixel_std.view(1, -1, 1, 1)
 
         # Pad
-        h, w = input_images.shape[-2:]
+        h, w = postprcess_images.shape[-2:]
         padh = self.image_encoder.img_size - h
         padw = self.image_encoder.img_size - w
-        input_images = F.pad(input_images, (0, padw, 0, padh))
+        postprcess_images = F.pad(postprcess_images, (0, padw, 0, padh))
 
         # image embeddings
-        image_embeddings = self.image_encoder(input_images)
+        image_embeddings = self.image_encoder(postprcess_images)
 
         sparse_embeddings, dense_embeddings = self.prompt_encoder(
             points=None,

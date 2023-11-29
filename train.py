@@ -1,8 +1,6 @@
-import glob
 import os
-import io
+import glob
 from typing import Any, Callable, Optional
-os.environ["CUDA_VISIBLE_DEVICES"]="3"
 
 import torch
 import torch.nn as nn
@@ -28,6 +26,7 @@ from dataset import SA1B_Dataset, SA1bSubset, input_transforms, target_transform
 from dataset import show_box, show_mask
 from LoRA import MonkeyPatchLoRAConv2D, MonkeyPatchLoRALinear, replace_LoRA
 from copy import deepcopy
+import argparse
 
 def create_sampled_grid(scales, orig_shape):
     y_scale, x_scale = scales
@@ -68,15 +67,25 @@ def compute_loss(pred, gt_mask, alpha = 0.25, gamma = 2):
     
     return focal_loss, dice_loss
 
-import datetime
+parser = argparse.ArgumentParser()
+parser.add_argument("--save_dir", type=str, default="./logs")
+parser.add_argument("--expname", type=str, required=True)
+parser.add_argument("--linear", action="store_true", default=False)
+parser.add_argument("--conv2d", action="store_true", default=False)
+parser.add_argument("--batch_size", type=int, default=8)
+parser.add_argument("--data_dir", type=str, default="./sa1b")
 
-date = datetime.datetime.now()
-writer_dir = "./logs/LoRA-{}-{}-{}:{}:{}".format(date.month, date.day, date.hour, date.minute, date.second)
+opt = parser.parse_args()
+
+if not os.path.exists(opt.save_dir):
+    os.makedirs(opt.save_dir)
+
+writer_dir = os.path.join(opt.save_dir, opt.expname)
 summary_writer = SummaryWriter(writer_dir)
 
 # Main Training Loop
 num_epochs = 10
-batch_size = 8
+batch_size = opt.batch_size
 lr = 1e-3
 
 def collate_fn(batches):
@@ -104,16 +113,27 @@ def calculateIoU(pred, gt):
 
 def train(model: Sam, train_dataset: SA1bSubset, test_dataset: SA1bSubset):
     model.cuda()
-    optimizer = Adam([p for p in LoRA_sam.parameters() if p.requires_grad], lr=lr)
+    optimizer = Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
+
+    # check existing data
+    ckpts = glob.glob(os.path.join(opt.save_dir, opt.expname, "*.pt"))
+    if len(ckpts) > 0:
+        ckpts.sort()
+        latest_ckpt = ckpts[-1]
+        states = torch.load(os.path.join(opt.save_dir, opt.expname, latest_ckpt), map_location=torch.device("cuda:0"))
+        model.load_state_dict(states["model_state"])
+        optimizer.load_state_dict(states["optimizer"])
+        start_epoch = states["epoch"]
+    else:
+        start_epoch = 0
     
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, collate_fn=collate_fn, 
                                             num_workers=8, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=2, collate_fn=collate_fn, 
-                                            num_workers=8, shuffle=True)
+                                            num_workers=8, shuffle=False)
     global_step = 0
 
-    for epoch in range(num_epochs):
-        
+    for epoch in range(start_epoch, num_epochs): 
         model.eval()
         with torch.no_grad():
             total_ious = torch.tensor([], device="cuda:0")
@@ -147,7 +167,7 @@ def train(model: Sam, train_dataset: SA1bSubset, test_dataset: SA1bSubset):
                         for b in box_cpu:
                             show_box(b, axis)
                     
-                    summary_writer.add_figure("test_{}/{}".format(epoch, batch_idx), fig, epoch)
+                    summary_writer.add_figure("test_{}".format(batch_idx), fig, epoch)
             
             mean_ious = total_ious.mean()
             print("TEST EPOCH {}, mIoU {}".format(epoch, mean_ious.item()))
@@ -155,34 +175,68 @@ def train(model: Sam, train_dataset: SA1bSubset, test_dataset: SA1bSubset):
 
         # training 
         model.train()
-        for batch_data, target in tqdm(train_loader):
+        for batch_idx, (batch_data, target) in tqdm(enumerate(train_loader)):
             
             target = torch.stack(target, dim=0).cuda()
             images = torch.stack([k["image"] for k in batch_data], dim=0).cuda()
             boxes = torch.stack([k["boxes"] for k in batch_data], dim=0).cuda()
 
-            pred = model.batch_forward_box(images, boxes, (160, 256), multimask_output=True)
+            pred = model.batch_forward_box(images, boxes, (160, 256), multimask_output=False)
 
             focal_loss, dice_loss = compute_loss(pred, target)
             loss = focal_loss + 0.01 * dice_loss
 
-            if global_step % 50 == 0:
+            with torch.no_grad():
+                binary_mask = pred > model.mask_threshold
+                binary_mask = binary_mask[:, 0, :, :]
+                h, w = target.shape[-2:]
+                target_mask = target.reshape(-1, h, w)
+
+                intersect = (binary_mask * target_mask).sum(dim=(-1, -2))
+                union = binary_mask.sum(dim=(-1, -2)) + target_mask.sum(dim=(-1, -2)) - intersect
+                ious = intersect.div(union)
+                train_ious = torch.mean(ious)
+
+            if batch_idx % 50 == 0:
                 print("ITER [{}] / EPOCH {}, loss: {}, focal: {}, dice: {}".format(global_step, epoch, loss.item(), focal_loss.item(), dice_loss.item()))
+
+                # visualize the first image
+                masks = [binary_mask[:10].cpu().numpy(), target_mask[:10].cpu().numpy()]
+                image_cpu = images[0].cpu().permute(1, 2, 0)
+                
+                fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+                for axis, mask in zip(axes, masks):
+                    axis.imshow(image_cpu)
+                    for m in mask:
+                        show_mask(m, axis, random_color=True)
+
+                summary_writer.add_figure("train_{}".format(batch_idx), fig, epoch)
             
             summary_writer.add_scalar("train/loss", loss.item(), global_step)
             summary_writer.add_scalar("train/focal", focal_loss.item(), global_step)
             summary_writer.add_scalar("train/dice", dice_loss.item(), global_step)
+            summary_writer.add_scalar("train/mIoU", train_ious.item(), global_step)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             global_step += 1
+
+        if epoch % 2 == 0 and epoch > 1:
+            name = os.path.join(writer_dir, "LoRA_sam_{:03d}.pt".format(epoch))
+            ckpt = {
+                "model_state": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch
+            }
+            torch.save(name, ckpt)
     
     # Save Model at the end
-    name = "LoRA_sam.pt"
+    name = os.path.join(writer_dir, "final.pt")
     ckpt = {
         "model_state": model.state_dict(),
-        "optimizer": optimizer.state_dict()
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch
     }
     torch.save(name, ckpt)
 
@@ -222,8 +276,11 @@ LoRA_sam = deepcopy(downsampled_sam)
 for param in LoRA_sam.parameters():
     param.requires_grad_(False)
 
-replace_LoRA(LoRA_sam, MonkeyPatchLoRALinear)
-replace_LoRA(LoRA_sam, MonkeyPatchLoRAConv2D)
+if opt.linear:
+    replace_LoRA(LoRA_sam.mask_decoder, MonkeyPatchLoRALinear)
+
+if opt.conv2d:
+    replace_LoRA(LoRA_sam, MonkeyPatchLoRAConv2D)
 
 print_params(LoRA_sam)
 

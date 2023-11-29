@@ -68,7 +68,7 @@ class SA1B_Dataset(torchvision.datasets.ImageFolder):
         num_masks = len(masks)
         
         # For training split, we randomly select NUM_MASK_PER_IMG masks
-        if num_masks >= NUM_MASK_PER_IMG and self.is_train:
+        if num_masks >= NUM_MASK_PER_IMG : # and self.is_train :
             all_mask_index = np.arange(num_masks)
             np.random.shuffle(all_mask_index)
             select_mask_indices = all_mask_index[:NUM_MASK_PER_IMG]
