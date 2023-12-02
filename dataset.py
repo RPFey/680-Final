@@ -29,6 +29,23 @@ target_transforms = transforms.Compose([
     transforms.Resize((160, 256), antialias=True),
 ])
 
+def collate_fn(batches):
+    batch_data = []
+    targets = []
+
+    for b in batches:
+        image, target, bbox = b
+        batch_data.append(
+            {
+                "image": image,
+                "boxes": bbox
+            }
+        )
+
+        targets.append(target)
+
+    return batch_data, targets
+
 class SA1B_Dataset(torchvision.datasets.ImageFolder):
     """A data loader for the SA-1B Dataset from "Segment Anything" (SAM)
     This class inherits from :class:`~torchvision.datasets.ImageFolder` so
@@ -47,9 +64,9 @@ class SA1B_Dataset(torchvision.datasets.ImageFolder):
         class_to_idx (dict): Dict with items (class_name, class_index).
         imgs (list): List of (image path, class_index) tuples
     """
-    def __init__(self, is_train=True, **kwargs):
+    def __init__(self, is_test=False, **kwargs):
         super(SA1B_Dataset, self).__init__(**kwargs)
-        self.is_train = is_train
+        self.is_test = is_test
 
     def __getitem__(self, index):
         """
@@ -68,7 +85,7 @@ class SA1B_Dataset(torchvision.datasets.ImageFolder):
         num_masks = len(masks)
         
         # For training split, we randomly select NUM_MASK_PER_IMG masks
-        if num_masks >= NUM_MASK_PER_IMG : # and self.is_train :
+        if num_masks >= NUM_MASK_PER_IMG and not self.is_test :
             all_mask_index = np.arange(num_masks)
             np.random.shuffle(all_mask_index)
             select_mask_indices = all_mask_index[:NUM_MASK_PER_IMG]
@@ -130,7 +147,7 @@ class SA1bSubset(SA1B_Dataset):
         img, target, bbox = super(SA1bSubset, self).__getitem__(sub_index)
 
         # Pad to NUM_MASK_PER_IMAGE
-        if self.is_train and len(bbox) < NUM_MASK_PER_IMG:
+        if not self.is_test and len(bbox) < NUM_MASK_PER_IMG:
             last_bbox = bbox[[-1]].repeat(NUM_MASK_PER_IMG - len(bbox), 1)
             bbox = torch.cat([bbox, last_bbox], dim=0)
             last_target = target[[-1]].repeat(NUM_MASK_PER_IMG - len(target), 1, 1)

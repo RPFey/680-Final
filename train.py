@@ -23,9 +23,8 @@ from segment_anything import SamPredictor
 from segment_anything.modeling.sam import Sam
 from segment_anything import sam_model_registry
 from dataset import SA1B_Dataset, SA1bSubset, input_transforms, target_transforms
-from dataset import show_box, show_mask
-from LoRA import MonkeyPatchLoRAConv2D, MonkeyPatchLoRALinear, replace_LoRA
-from copy import deepcopy
+from dataset import show_box, show_mask, collate_fn
+from LoRA import downsamle_SAM, calculateIoU, lowres_SAM
 import argparse
 
 def create_sampled_grid(scales, orig_shape):
@@ -67,73 +66,66 @@ def compute_loss(pred, gt_mask, alpha = 0.25, gamma = 2):
     
     return focal_loss, dice_loss
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--save_dir", type=str, default="./logs")
-parser.add_argument("--expname", type=str, required=True)
-parser.add_argument("--linear", action="store_true", default=False)
-parser.add_argument("--conv2d", action="store_true", default=False)
-parser.add_argument("--batch_size", type=int, default=8)
-parser.add_argument("--data_dir", type=str, default="./sa1b")
-
-opt = parser.parse_args()
-
-if not os.path.exists(opt.save_dir):
-    os.makedirs(opt.save_dir)
-
-writer_dir = os.path.join(opt.save_dir, opt.expname)
-summary_writer = SummaryWriter(writer_dir)
-
-# Main Training Loop
-num_epochs = 10
-batch_size = opt.batch_size
-lr = 1e-3
-
-def collate_fn(batches):
-    batch_data = []
-    targets = []
-
-    for b in batches:
-        image, target, bbox = b
-        batch_data.append(
-            {
-                "image": image,
-                "boxes": bbox
-            }
-        )
-
-        targets.append(target)
-
-    return batch_data, targets
-
-def calculateIoU(pred, gt):
-    intersect = (pred * gt).sum(dim=(-1, -2))
-    union = pred.sum(dim=(-1, -2)) + gt.sum(dim=(-1, -2)) - intersect
-    ious = intersect.div(union)
-    return ious
-
-def train(model: Sam, train_dataset: SA1bSubset, test_dataset: SA1bSubset):
+def test(model: Sam, test_dataset: SA1bSubset, opt):
     model.cuda()
-    optimizer = Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
-
-    # check existing data
     ckpts = glob.glob(os.path.join(opt.save_dir, opt.expname, "*.pt"))
+    # Load the latest checkpoint for testing
     if len(ckpts) > 0:
         ckpts.sort()
         latest_ckpt = ckpts[-1]
-        states = torch.load(os.path.join(opt.save_dir, opt.expname, latest_ckpt), map_location=torch.device("cuda:0"))
+        states = torch.load(latest_ckpt, map_location=torch.device("cuda:0"))
+        model.load_state_dict(states["model_state"])
+    else:
+        raise Exception(" No ckpts found in {} ".format(os.path.join(opt.save_dir, opt.expname)))
+    
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=2, collate_fn=collate_fn, 
+                                            num_workers=8, shuffle=False)
+    
+    with torch.no_grad():
+        total_ious = torch.tensor([], device="cuda:0")
+        for batch_idx, (batch_data, target) in tqdm(enumerate(test_loader)):
+            target = [t.cuda() for t in target]
+        
+            update_batches = []
+            for idx, batch in enumerate(batch_data):
+                update_batch = {k:v.cuda() for k, v in batch.items()}
+                update_batch["original_size"] = (160, 256)
+                update_batches.append(update_batch)
+
+            pred = model(update_batches, multimask_output=False)
+            pred_mask = [p["masks"].squeeze(1) for p in pred] 
+            
+            for p, t in zip(pred_mask, target):
+                ious = calculateIoU(p, t)
+                total_ious = torch.cat([total_ious, ious])
+        
+        mean_ious = total_ious.mean()
+        print("TEST total masks {} mIoU {}".format(len(total_ious), mean_ious.item()))
+
+def train(model: Sam, train_dataset: SA1bSubset, test_dataset: SA1bSubset, opt, summary_writer: SummaryWriter):
+    model.cuda()
+    optimizer = Adam([p for p in model.parameters() if p.requires_grad], lr=opt.lr)
+
+    # check existing data
+    writer_dir = os.path.join(opt.save_dir, opt.expname)
+    ckpts = glob.glob(writer_dir, "*.pt")
+    if len(ckpts) > 0:
+        ckpts.sort()
+        latest_ckpt = ckpts[-1]
+        states = torch.load(latest_ckpt, map_location=torch.device("cuda:0"))
         model.load_state_dict(states["model_state"])
         optimizer.load_state_dict(states["optimizer"])
         start_epoch = states["epoch"]
+        global_step = states["global_step"]
     else:
         start_epoch = 0
+        global_step = 0
     
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, collate_fn=collate_fn, 
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batch_size, collate_fn=collate_fn, 
                                             num_workers=8, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=2, collate_fn=collate_fn, 
                                             num_workers=8, shuffle=False)
-    global_step = 0
-
-    for epoch in range(start_epoch, num_epochs): 
+    for epoch in range(start_epoch, opt.num_epochs): 
         model.eval()
         with torch.no_grad():
             total_ious = torch.tensor([], device="cuda:0")
@@ -223,79 +215,68 @@ def train(model: Sam, train_dataset: SA1bSubset, test_dataset: SA1bSubset):
             global_step += 1
 
         if epoch % 2 == 0 and epoch > 1:
-            name = os.path.join(writer_dir, "LoRA_sam_{:03d}.pt".format(epoch))
+            name = os.path.join(writer_dir, "LoRA_sam_{}.pt".format(epoch))
             ckpt = {
                 "model_state": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
-                "epoch": epoch
+                "epoch": epoch,
+                "global_step": global_step
             }
-            torch.save(name, ckpt)
+
+            torch.save(ckpt, name)
     
     # Save Model at the end
-    name = os.path.join(writer_dir, "final.pt")
+    name = os.path.join(writer_dir, "LoRA_sam_{}.pt".format(epoch))
     ckpt = {
         "model_state": model.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "epoch": epoch
+        "epoch": epoch,
+        "global_step": global_step
     }
-    torch.save(name, ckpt)
+    torch.save(ckpt, name)
 
-# Copy SAM Model
-sam = sam_model_registry["vit_b"](checkpoint="sam_vit_b_01ec64.pth")
-downsampled_sam = deepcopy(sam)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--save_dir", type=str, default="./logs")
+    parser.add_argument("--expname", type=str, required=True)
+    parser.add_argument("--linear", action="store_true", default=False)
+    parser.add_argument("--conv2d", action="store_true", default=False)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--num_epochs", type=int, default=10)
+    parser.add_argument("--data_dir", type=str, default="./sa1b")
 
-# Since SAM Resolution is 1024 x 1024 \ Current input resolution is 160 x 256
-# Y axis - Downsample 6.4 \ X axis - Downsample 4
-filter_shape = sam.image_encoder.patch_embed.proj.weight.data.shape[-2:]
+    opt = parser.parse_args()
 
-# hack SAM PE module
-_, H, W, _ = sam.image_encoder.pos_embed.shape
-pos_embed_feature = sam.image_encoder.pos_embed.data[:, :H//4, :W//4, :]
+    if not os.path.exists(opt.save_dir):
+        os.makedirs(opt.save_dir)
 
-del downsampled_sam.image_encoder.pos_embed
-downsampled_sam.image_encoder.pos_embed = nn.Parameter(pos_embed_feature)
+    writer_dir = os.path.join(opt.save_dir, opt.expname)
+    summary_writer = SummaryWriter(writer_dir)
+    
+    path = './sa1b'
+    dataset = SA1B_Dataset(root=path, transform=input_transforms, target_transform=target_transforms)
+    all_index = np.arange(len(dataset))
+    np.random.shuffle(all_index)
+    train_num = int(0.8 * len(dataset))
 
-# Test on low resolution
-downsampled_sam.image_encoder.img_size = 256
-downsampled_sam.prompt_encoder.factor = 4
-downsampled_sam.prompt_encoder.image_embedding_size = (16, 16)
+    # 128 as val index
+    train_index = all_index[:train_num-128]
+    val_index = all_index[train_num-128:train_num]
+    test_index = all_index[train_num:]
 
-# remove downsampled SAM
-# del downsampled_sam
+    print("Loading Datasets ...")
+    train_dataset = SA1bSubset(train_index, is_test=False, root=path, 
+                                transform=input_transforms, target_transform=target_transforms)
+    val_dataset = SA1bSubset(test_index, is_test=False, root=path, 
+                                transform=input_transforms, target_transform=target_transforms)
+    test_dataset = SA1bSubset(test_index, is_test=True, root=path, 
+                                transform=input_transforms, target_transform=target_transforms)
+    
+    # Copy SAM Model
+    sam = sam_model_registry["vit_b"](checkpoint="sam_vit_b_01ec64.pth")
+    # LoRA_sam = downsamle_SAM(sam, opt)
+    LoRA_sam = lowres_SAM(sam, opt, train_dataset, val_dataset)
 
-def print_params(model):
-    model_parameters = filter(lambda p: True, model.parameters())
-    params = sum([np.prod(p.size()) for p in model_parameters])
-    print("total params: ", params)
-    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
-    params = sum([np.prod(p.size()) for p in model_parameters])
-    print("training params: ", params)
-
-# inject LoRA
-LoRA_sam = deepcopy(downsampled_sam)
-for param in LoRA_sam.parameters():
-    param.requires_grad_(False)
-
-if opt.linear:
-    replace_LoRA(LoRA_sam.mask_decoder, MonkeyPatchLoRALinear)
-
-if opt.conv2d:
-    replace_LoRA(LoRA_sam, MonkeyPatchLoRAConv2D)
-
-print_params(LoRA_sam)
-
-path = './sa1b'
-dataset = SA1B_Dataset(root=path, transform=input_transforms, target_transform=target_transforms)
-all_index = np.arange(len(dataset))
-np.random.shuffle(all_index)
-train_num = int(0.8 * len(dataset))
-train_index = all_index[:-128]
-test_index = all_index[-128:]
-
-print("Loading Datasets ...")
-train_dataset = SA1bSubset(train_index, is_train=True, root=path, 
-                            transform=input_transforms, target_transform=target_transforms)
-test_dataset = SA1bSubset(test_index, is_train=False, root=path, 
-                            transform=input_transforms, target_transform=target_transforms)
-
-train(LoRA_sam, train_dataset, test_dataset)
+    # train(LoRA_sam, train_dataset, val_dataset, opt, summary_writer)
+    # test(LoRA_sam, test_dataset, opt, summary_writer)
