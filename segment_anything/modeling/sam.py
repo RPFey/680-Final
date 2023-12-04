@@ -201,6 +201,80 @@ class Sam(nn.Module):
             masks = masks > self.mask_threshold
 
         return masks
+    
+    def batch_forward_points(
+        self,
+        input_images: torch.Tensor,
+        point_coords: torch.Tensor,
+        original_size,
+        multimask_output: bool,
+    ) -> List[Dict[str, torch.Tensor]]:
+        """
+        Predicts masks end-to-end from provided images and boxes.
+        If prompts are not known in advance, using SamPredictor is
+        recommended over calling the model directly.
+
+        Arguments:
+            'image': The image as a torch tensor in Bx3xHxW format,
+            already transformed for input to the model.
+            'original_size': (tuple(int, int)) The original size of
+            the image before transformation, as (H, W).
+            'boxes': (torch.Tensor) Batched box inputs, with shape BxNx4.
+            Already transformed to the input frame of the model.
+          multimask_output (bool): Whether the model should predict multiple
+            disambiguating masks, or return a single mask.
+
+        Returns:
+          (list(dict)): A list over input images, where each element is
+            as dictionary with the following keys.
+              'masks': (torch.Tensor) Batched binary mask predictions,
+                with shape BxCxHxW, where B is the number of input prompts,
+                C is determined by multimask_output, and (H, W) is the
+                original size of the image.
+              'iou_predictions': (torch.Tensor) The model's predictions
+                of mask quality, in shape BxC.
+              'low_res_logits': (torch.Tensor) Low resolution logits with
+                shape BxCxHxW, where H=W=256. Can be passed as mask input
+                to subsequent iterations of prediction.
+        """
+        # Normalize colors
+        postprcess_images = (input_images - self.pixel_mean.view(1, -1, 1, 1)) / self.pixel_std.view(1, -1, 1, 1)
+
+        # Pad
+        h, w = postprcess_images.shape[-2:]
+        padh = self.image_encoder.img_size - h
+        padw = self.image_encoder.img_size - w
+        postprcess_images = F.pad(postprcess_images, (0, padw, 0, padh))
+
+        # image embeddings
+        image_embeddings = self.image_encoder(postprcess_images)
+
+        
+        point_labels = torch.ones(*point_coords.shape[:-1], device=point_coords.device)
+        sparse_embeddings, dense_embeddings = self.prompt_encoder(
+            points=(point_coords, point_labels),
+            boxes=None,
+            masks=None,
+        )
+
+        low_res_masks, iou_predictions = self.mask_decoder(
+            image_embeddings=image_embeddings,
+            image_pe=self.prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=multimask_output,
+        )
+
+        masks = self.postprocess_masks(
+            low_res_masks,
+            input_size=input_images.shape[-2:],
+            original_size=original_size,
+        )
+        
+        if not self.training:
+            masks = masks > self.mask_threshold
+
+        return masks
 	
     def postprocess_masks(
         self,

@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 
 from pycocotools import mask as mask_utils
-
+import random
 import json
 import numpy as np
 from tqdm import tqdm
@@ -37,8 +37,27 @@ def collate_fn(batches):
         image, target, bbox = b
         batch_data.append(
             {
-                "image": image,
+                "image": image * 255.,
                 "boxes": bbox
+            }
+        )
+
+        targets.append(target)
+
+    return batch_data, targets
+
+def collate_fn_point(batches):
+    batch_data = []
+    targets = []
+
+    for b in batches:
+        image, target, pts = b
+        batch_data.append(
+            {
+                "image": image * 255.,
+                "point_coords": pts,
+                # since all are foreground, the labels are all one.
+                "point_labels": torch.ones(*pts.shape[:2])
             }
         )
 
@@ -110,7 +129,19 @@ class SA1B_Dataset(torchvision.datasets.ImageFolder):
         bbox = []
         for mask in target:
             mask_y, mask_x = torch.where(mask > 0)
-            bbox.append(torch.tensor([mask_x.min(), mask_y.min(), mask_x.max(), mask_y.max()]))
+            x1, y1, x2, y2 = mask_x.min(), mask_y.min(), mask_x.max(), mask_y.max()
+            
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+            w = (x2 - x1)
+            h = (y2 - y1)
+            delta_w = min(random.random() * 0.2 * w, 20)
+            delta_h = min(random.random() * 0.2 * h, 20)
+
+            x1, y1, x2, y2  = center_x - (w + delta_w) / 2, center_y - (h + delta_h) / 2, \
+                                center_x + (w + delta_w) / 2, center_y + (h + delta_h) / 2
+            bbox.append(torch.tensor([x1, y1, x2, y2]))
+
         bbox = torch.stack(bbox, dim=0)
 
         return image, target, bbox
@@ -155,6 +186,37 @@ class SA1bSubset(SA1B_Dataset):
 
         return img, target, bbox
     
+class SA1bSubsetPoint(SA1B_Dataset):
+    def __init__(self, subset_index:np.ndarray, num_points:int = 1, **kwargs):
+        super(SA1bSubsetPoint, self).__init__(**kwargs)
+        self.subset_index = subset_index
+        self.num_points = num_points
+
+        assert np.max(subset_index) < super(SA1bSubsetPoint, self).__len__()
+    
+    def __len__(self):
+        return len(self.subset_index)
+    
+    def __getitem__(self, index):
+        # get data in the subset 
+        sub_index = self.subset_index[index]
+        img, target, _ = super(SA1bSubsetPoint, self).__getitem__(sub_index)
+
+        # Pad to NUM_MASK_PER_IMAGE
+        if not self.is_test and len(target) < NUM_MASK_PER_IMG:            
+            last_target = target[[-1]].repeat(NUM_MASK_PER_IMG - len(target), 1, 1)
+            target = torch.cat([target, last_target], dim=0)
+
+        pts = []
+        for mask in target:
+            points_y, points_x = torch.where(mask > 0)
+            chosen_index = torch.randperm(len(points_x))[:self.num_points]
+            # chosen_index = torch.arange(len(points_x))[:self.num_points]
+            pts.append(torch.stack([points_x[chosen_index], points_y[chosen_index]], dim = 1)) # (N, 2)
+        pts = torch.stack(pts, dim=0) # (B, N, 2)
+
+        return img, target, pts
+
 # !pip install git+https://github.com/facebookresearch/segment-anything.git
 # you may want to make a local copy instead of pip install,
 # as you may need to modify their code

@@ -7,6 +7,7 @@ import numpy as np
 from torch.optim import Adam
 from dataset import collate_fn
 from tqdm import tqdm
+import os
 
 def calculateIoU(pred, gt):
     intersect = (pred * gt).sum(dim=(-1, -2))
@@ -237,77 +238,10 @@ def downsamle_SAM(sam, opt):
 
 def lowres_SAM(sam, opt, train_dataset, val_dataset):
     sam.cuda()
+    writer_dir = os.path.join(opt.save_dir, opt.expname)
     
     patchify_model = nn.Conv2d(3, 768, kernel_size=(4, 4), stride=(4, 4))
-    patchify_model.cuda()
     upsampler = torch.nn.Upsample((1024, 1024))
-
-    dist_lr = 1e-3
-    optimizer = Adam(patchify_model.parameters(), dist_lr)
-    finetune_epoch = 10
-
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batch_size, collate_fn=collate_fn, 
-                                            num_workers=8, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(val_dataset, batch_size=2, collate_fn=collate_fn, 
-                                            num_workers=8, shuffle=False)
-
-    print(" Dist Start ... ")
-    for epoch in range(finetune_epoch): 
-        # training 
-        patchify_model.train()
-        avg_loss = []
-        for batch_idx, (batch_data, target) in tqdm(enumerate(train_loader)):
-            
-            images = torch.stack([k["image"] for k in batch_data], dim=0).cuda()
-            padh = 256 - images.shape[2]
-            padw = 256 - images.shape[3]
-            images = F.pad(images, (0, padw, 0, padh))
-
-            # Upsample images
-            upsampled = upsampler(images)
-            target = sam.image_encoder.patch_embed.proj(upsampled)
-
-            pred = patchify_model(images)
-            loss = torch.mean( (pred - target) ** 2 )
-            
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            avg_loss.append(loss.item())
-
-            if batch_idx % 50 == 0:
-                print(" Dist Epoch {} / {};  Avg Loss {} ".format(batch_idx, epoch, torch.tensor(avg_loss).mean()))
-
-        avg_loss = torch.tensor(avg_loss).mean()
-        print(" Dist Epoch {} avg loss {}".format(epoch, avg_loss.item()))
-    
-    print(" Testing ... ")
-    sam.image_encoder.patch_embed.proj = patchify_model
-    sam.image_encoder.img_size = 256
-
-    with torch.no_grad():
-        total_ious = torch.tensor([], device="cuda:0")
-        for batch_idx, (batch_data, target) in tqdm(enumerate(test_loader)):
-            target = [t.cuda() for t in target]
-        
-            update_batches = []
-            for idx, batch in enumerate(batch_data):
-                update_batch = {k:v.cuda() for k, v in batch.items()}
-                update_batch["original_size"] = (160, 256)
-                update_batches.append(update_batch)
-
-            pred = sam(update_batches, multimask_output=False)
-            pred_mask = [p["masks"].squeeze(1) for p in pred] 
-            
-            for p, t in zip(pred_mask, target):
-                ious = calculateIoU(p, t)
-                total_ious = torch.cat([total_ious, ious])
-        
-        mean_ious = total_ious.mean()
-        print("TEST total masks {} mIoU {}".format(len(total_ious), mean_ious.item()))
-
-    import pdb; pdb.set_trace()
 
     LoRA_sam = deepcopy(sam)
     for param in LoRA_sam.parameters():
@@ -320,5 +254,86 @@ def lowres_SAM(sam, opt, train_dataset, val_dataset):
         replace_LoRA(LoRA_sam, MonkeyPatchLoRAConv2D)
 
     print_params(LoRA_sam)
+    LoRA_sam.image_encoder.patch_embed.proj = patchify_model
+    LoRA_sam.image_encoder.img_size = 256
+    LoRA_sam.cuda()
+
+    if os.path.exists(os.path.join(writer_dir, "conv2d.pt")):
+
+        model_state = torch.load(os.path.join(writer_dir, "conv2d.pt"), map_location=torch.device("cuda:0"))
+        LoRA_sam.load_state_dict(model_state["model_state"])
+
+    else:
+        dist_lr = 1e-3
+        optimizer = Adam(patchify_model.parameters(), dist_lr)
+        finetune_epoch = 10
+
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batch_size, collate_fn=collate_fn, 
+                                                num_workers=8, shuffle=True)
+        test_loader = torch.utils.data.DataLoader(val_dataset, batch_size=2, collate_fn=collate_fn, 
+                                                num_workers=8, shuffle=False)
+
+        print(" Dist Start ... ")
+        for epoch in range(finetune_epoch): 
+            # training 
+            patchify_model.train()
+            avg_loss = []
+            for batch_idx, (batch_data, target) in tqdm(enumerate(train_loader)):
+                
+                images = torch.stack([k["image"] for k in batch_data], dim=0).cuda()
+                padh = 256 - images.shape[2]
+                padw = 256 - images.shape[3]
+                images = F.pad(images, (0, padw, 0, padh))
+
+                # Upsample images
+                upsampled = upsampler(images)
+                target = sam.image_encoder.patch_embed.proj(upsampled)
+
+                pred = LoRA_sam.image_encoder.patch_embed.proj(images)
+                loss = torch.mean( (pred - target) ** 2 )
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                avg_loss.append(loss.item())
+
+                if batch_idx % 50 == 0:
+                    print(" Dist Epoch {} / {};  Avg Loss {} ".format(batch_idx, epoch, torch.tensor(avg_loss).mean()))
+
+            avg_loss = torch.tensor(avg_loss).mean()
+            print(" Dist Epoch {} avg loss {}".format(epoch, avg_loss.item()))
+        
+        print(" Testing ... ")
+
+        with torch.no_grad():
+            total_ious = torch.tensor([], device="cuda:0")
+            for batch_idx, (batch_data, target) in tqdm(enumerate(test_loader)):
+                target = [t.cuda() for t in target]
+            
+                update_batches = []
+                for idx, batch in enumerate(batch_data):
+                    update_batch = {k:v.cuda() for k, v in batch.items()}
+                    update_batch["original_size"] = (160, 256)
+                    update_batches.append(update_batch)
+
+                pred = LoRA_sam(update_batches, multimask_output=False)
+                pred_mask = [p["masks"].squeeze(1) for p in pred] 
+                
+                for p, t in zip(pred_mask, target):
+                    ious = calculateIoU(p, t)
+                    total_ious = torch.cat([total_ious, ious])
+            
+            mean_ious = total_ious.mean()
+            print("TEST total masks {} mIoU {}".format(len(total_ious), mean_ious.item()))
+        
+        # Save ckpt
+        name = os.path.join(writer_dir, "conv2d.pt".format(epoch))
+        ckpt = {
+            "model_state": LoRA_sam.state_dict()
+        }
+        torch.save(ckpt, name)
+
+
     return LoRA_sam
 

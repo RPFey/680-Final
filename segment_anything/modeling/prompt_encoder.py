@@ -79,6 +79,12 @@ class PromptEncoder(nn.Module):
     ) -> torch.Tensor:
         """Embeds point prompts."""
         points = points + 0.5  # Shift to center of pixel
+        
+        # flatten the first two axis
+        num_clicked_points = points.shape[-2]
+        points = points.reshape(-1, num_clicked_points, 2)
+        labels = labels.reshape(-1, num_clicked_points)
+        
         if pad:
             padding_point = torch.zeros((points.shape[0], 1, 2), device=points.device)
             padding_label = -torch.ones((labels.shape[0], 1), device=labels.device)
@@ -115,7 +121,12 @@ class PromptEncoder(nn.Module):
         Gets the batch size of the output given the batch size of the input prompts.
         """
         if points is not None:
-            return points[0].shape[0]
+            if points[0].ndim == 3:
+                return points[0].shape[0]
+            elif points[0].ndim == 4:
+                return points[0].shape[0] * points[0].shape[1]
+            else:
+                raise NotImplementedError(" Box shape {} not accepted".format(boxes.shape))
         elif boxes is not None:
             if boxes.ndim == 2:
                 return boxes.shape[0]

@@ -22,24 +22,10 @@ from tqdm import tqdm
 from segment_anything import SamPredictor
 from segment_anything.modeling.sam import Sam
 from segment_anything import sam_model_registry
-from dataset import SA1B_Dataset, SA1bSubset, input_transforms, target_transforms
-from dataset import show_box, show_mask, collate_fn
+from dataset import SA1B_Dataset, SA1bSubset, input_transforms, target_transforms, SA1bSubsetPoint
+from dataset import show_points, show_mask, collate_fn, collate_fn_point
 from LoRA import downsamle_SAM, calculateIoU, lowres_SAM
 import argparse
-
-def create_sampled_grid(scales, orig_shape):
-    y_scale, x_scale = scales
-    y_shape, x_shape = orig_shape
-
-    sampled_coord = torch.meshgrid(torch.arange(0, y_shape, y_scale).float(), 
-            torch.arange(0, x_shape, x_scale).float())
-    
-    sampled_coord = torch.stack(sampled_coord, dim=-1)
-    print(sampled_coord[..., 0], sampled_coord[..., 1])
-    sampled_coord[..., 0] = (sampled_coord[..., 0] - y_shape / 2) / y_shape / 2
-    sampled_coord[..., 1] = (sampled_coord[..., 1] - x_shape / 2) / x_shape / 2
-
-    return sampled_coord
 
 from torch.optim import Adam
 import random
@@ -78,7 +64,7 @@ def test(model: Sam, test_dataset: SA1bSubset, opt):
     else:
         raise Exception(" No ckpts found in {} ".format(os.path.join(opt.save_dir, opt.expname)))
     
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=2, collate_fn=collate_fn, 
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=2, collate_fn=collate_fn_point, 
                                             num_workers=8, shuffle=False)
     
     with torch.no_grad():
@@ -120,13 +106,10 @@ def train(model: Sam, train_dataset: SA1bSubset, test_dataset: SA1bSubset, opt, 
     else:
         start_epoch = 0
         global_step = 0
-
-    if start_epoch == opt.num_epochs - 1:
-        return
     
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batch_size, collate_fn=collate_fn, 
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batch_size, collate_fn=collate_fn_point, 
                                             num_workers=8, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=2, collate_fn=collate_fn, 
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=2, collate_fn=collate_fn_point, 
                                             num_workers=8, shuffle=False)
     for epoch in range(start_epoch, opt.num_epochs): 
         model.eval()
@@ -152,15 +135,16 @@ def train(model: Sam, train_dataset: SA1bSubset, test_dataset: SA1bSubset, opt, 
                 if batch_idx in [0, 5, 10]:
                     masks = [pred_mask[0].cpu().numpy(), target[0].cpu().numpy()]
                     image_cpu = update_batches[0]["image"].cpu().permute(1, 2, 0)
-                    box_cpu = update_batches[0]["boxes"].cpu()
+                    points_cpu = update_batches[0]["point_coords"].cpu()
+                    point_labels_cpu = update_batches[0]["point_labels"].cpu()
 
                     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
                     for axis, mask in zip(axes, masks):
                         axis.imshow(image_cpu / 255.)
-                        for m in mask:
+                        for m in mask[4:7]:
                             show_mask(m, axis, random_color=True)
-                        for b in box_cpu:
-                            show_box(b, axis)
+                        for p, p_l in zip(points_cpu, point_labels_cpu):
+                            show_points(p, p_l, axis)
                     
                     summary_writer.add_figure("test_{}".format(batch_idx), fig, epoch)
             
@@ -174,9 +158,9 @@ def train(model: Sam, train_dataset: SA1bSubset, test_dataset: SA1bSubset, opt, 
             
             target = torch.stack(target, dim=0).cuda()
             images = torch.stack([k["image"] for k in batch_data], dim=0).cuda()
-            boxes = torch.stack([k["boxes"] for k in batch_data], dim=0).cuda()
+            point_coords = torch.stack([k["point_coords"] for k in batch_data], dim=0).cuda()
 
-            pred = model.batch_forward_box(images, boxes, (160, 256), multimask_output=False)
+            pred = model.batch_forward_points(images, point_coords, (160, 256), multimask_output=False)
 
             focal_loss, dice_loss = compute_loss(pred, target)
             loss = focal_loss + 0.01 * dice_loss
@@ -261,7 +245,7 @@ if __name__ == "__main__":
     path = './sa1b'
     dataset = SA1B_Dataset(root=path, transform=input_transforms, target_transform=target_transforms)
     all_index = np.arange(len(dataset))
-    np.random.shuffle(all_index)
+    # np.random.shuffle(all_index)
     train_num = int(0.8 * len(dataset))
 
     # 128 as val index
@@ -270,11 +254,11 @@ if __name__ == "__main__":
     test_index = all_index[train_num:]
 
     print("Loading Datasets ...")
-    train_dataset = SA1bSubset(train_index, is_test=False, root=path, 
+    train_dataset = SA1bSubsetPoint(train_index, num_points=2, is_test=False, root=path, 
                                 transform=input_transforms, target_transform=target_transforms)
-    val_dataset = SA1bSubset(val_index, is_test=False, root=path, 
+    val_dataset = SA1bSubsetPoint(val_index, num_points=2, is_test=False, root=path, 
                                 transform=input_transforms, target_transform=target_transforms)
-    test_dataset = SA1bSubset(test_index, is_test=True, root=path, 
+    test_dataset = SA1bSubsetPoint(test_index, num_points=2, is_test=True, root=path, 
                                 transform=input_transforms, target_transform=target_transforms)
     
     # Copy SAM Model
