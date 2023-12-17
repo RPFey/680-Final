@@ -23,7 +23,7 @@ from segment_anything import SamPredictor
 from segment_anything.modeling.sam import Sam
 from segment_anything import sam_model_registry
 from dataset import SA1B_Dataset, SA1bSubset, input_transforms, target_transforms
-from dataset import show_box, show_mask, collate_fn
+from dataset import show_box, show_mask, collate_fn, show_image, input_reverse_transforms
 from LoRA import downsamle_SAM, calculateIoU, lowres_SAM
 import argparse
 
@@ -40,6 +40,32 @@ def create_sampled_grid(scales, orig_shape):
     sampled_coord[..., 1] = (sampled_coord[..., 1] - x_shape / 2) / x_shape / 2
 
     return sampled_coord
+
+def box_sample(all_masks, bbox):
+    # all_masks: [N, H, W], one image, N masks
+    # bbox: (xyxy)
+    # return: sampled_masks: [3, H, W], masks order from big to small
+    # you can modify the signature of this function
+    selected_mask = []
+    for mask in all_masks:
+        x1, y1, x2, y2 = torch.ceil(bbox[0]).int(), torch.floor(bbox[1]).int(), \
+            torch.ceil(bbox[2]).int(), torch.floor(bbox[3]).int()
+        RoI = mask[y1:y2, x1:x2]
+
+        if torch.sum(RoI) / ( (x2 - x1) * (y2 - y1) ) > 0.5:
+            selected_mask.append(mask)
+    print(len(selected_mask))
+    selected_mask.sort(key=lambda x: x.sum(), reverse=True)
+    selected_mask = torch.stack(selected_mask)
+    if len(selected_mask) < 3:
+        pad_num = 3 - len(selected_mask)
+        selected_mask = torch.cat([
+            selected_mask, selected_mask[[-1]].repeat(pad_num, 1, 1)
+        ], dim=0)
+    else:
+        selected_mask = selected_mask[:3]
+    
+    return selected_mask
 
 from torch.optim import Adam
 import random
@@ -259,7 +285,7 @@ if __name__ == "__main__":
     summary_writer = SummaryWriter(writer_dir)
     
     path = './sa1b'
-    dataset = SA1B_Dataset(root=path, transform=input_transforms, target_transform=target_transforms)
+    dataset = SA1B_Dataset(root=path, transform=input_transforms, is_test=True, target_transform=target_transforms)
     all_index = np.arange(len(dataset))
     np.random.shuffle(all_index)
     train_num = int(0.8 * len(dataset))
@@ -277,6 +303,23 @@ if __name__ == "__main__":
     test_dataset = SA1bSubset(test_index, is_test=True, root=path, 
                                 transform=input_transforms, target_transform=target_transforms)
     
+    # img, target, box = dataset[1048]
+    # image = input_reverse_transforms(img)
+    # image = np.array(image)
+    # import pdb; pdb.set_trace()
+    # show_image(image, target, 8, 8)
+    
+    # box_id = box[2]
+    # assign_target = box_sample(target, box_id)
+    # fig, axes = plt.subplots(1, 1, figsize=(6, 6))
+    # image_cpu = img.permute(1, 2, 0)
+    # axes.imshow(image_cpu)
+    # for m in assign_target:
+    #     show_mask(m, axes, random_color=True)
+    # show_box(box_id, axes)
+    # plt.axis("off")
+    # fig.savefig("box_assign.png")
+
     # Copy SAM Model
     sam = sam_model_registry["vit_b"](checkpoint="sam_vit_b_01ec64.pth")
     if opt.method == "downsample":

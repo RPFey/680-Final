@@ -17,6 +17,21 @@ import json
 import numpy as np
 from tqdm import tqdm
 
+def get_bbox_from_mask(target):
+    bbox = []
+    valid_index = []
+    for idx, mask in enumerate(target):
+        if mask.sum() > 0.:
+            coord_y, coord_x = torch.where(mask > 0)
+            if len(coord_x) == 0:
+                import pdb; pdb.set_trace()
+            x1, y1 = coord_x.min(), coord_y.min()
+            x2, y2 = coord_x.max(), coord_y.max()
+            bbox.append(torch.stack([x1, y1, x2, y2])) # (Image Coordinate)
+            valid_index.append(idx)
+
+    return torch.stack(bbox), valid_index
+
 NUM_MASK_PER_IMG = 16
 
 input_transforms = transforms.Compose([
@@ -27,6 +42,10 @@ input_transforms = transforms.Compose([
 target_transforms = transforms.Compose([
     transforms.ToTensor(),
     transforms.Resize((160, 256), antialias=True),
+])
+
+input_reverse_transforms = transforms.Compose([
+    transforms.ToPILImage(),
 ])
 
 def collate_fn(batches):
@@ -86,6 +105,7 @@ class SA1B_Dataset(torchvision.datasets.ImageFolder):
     def __init__(self, is_test=False, **kwargs):
         super(SA1B_Dataset, self).__init__(**kwargs)
         self.is_test = is_test
+        self.imgs.sort(key=lambda x: x[0])
 
     def __getitem__(self, index):
         """
@@ -241,4 +261,25 @@ def show_box(box, ax):
     x0, y0 = box[0], box[1]
     w, h = box[2] - box[0], box[3] - box[1]
     ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0,0,0,0), lw=2)) 
+
+def show_image(image, target, row=12, col=12):
+    # image: numpy image
+    # target: mask [N, H, W]
+    bbox, vidx = get_bbox_from_mask(target)
+    target = target[vidx]
+    fig, axs = plt.subplots(row, col, figsize=(20, 12))
+    for i in range(row):
+        for j in range(col):
+            if i*row+j < target.shape[0]:
+                box = bbox[i*row+j]
+                canvas = image.copy()
+                cv2.rectangle(canvas, (box[0].item(), box[1].item()),
+                                (box[2].item(), box[3].item()), (255, 0, 0))
+                axs[i, j].imshow(canvas)
+                axs[i, j].imshow(target[i*row+j], alpha=0.5)
+            else:
+                axs[i, j].imshow(image)
+            axs[i, j].axis('off')
+    plt.tight_layout()
+    plt.savefig("image.png")
     

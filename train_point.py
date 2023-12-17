@@ -23,7 +23,7 @@ from segment_anything import SamPredictor
 from segment_anything.modeling.sam import Sam
 from segment_anything import sam_model_registry
 from dataset import SA1B_Dataset, SA1bSubset, input_transforms, target_transforms, SA1bSubsetPoint
-from dataset import show_points, show_mask, collate_fn, collate_fn_point
+from dataset import show_points, show_mask, collate_fn, collate_fn_point, input_reverse_transforms, show_image
 from LoRA import downsamle_SAM, calculateIoU, lowres_SAM
 import argparse
 
@@ -31,6 +31,58 @@ from torch.optim import Adam
 import random
 import pdb
 from torch.utils.tensorboard import SummaryWriter
+
+def box_sample(all_masks, bbox):
+    # all_masks: [N, H, W], one image, N masks
+    # bbox: (xyxy)
+    # return: sampled_masks: [3, H, W], masks order from big to small
+    # you can modify the signature of this function
+    selected_mask = []
+    for mask in all_masks:
+        x1, y1, x2, y2 = torch.ceil(bbox[0]).int(), torch.floor(bbox[1]).int(), \
+            torch.ceil(bbox[2]).int(), torch.floor(bbox[3]).int()
+        RoI = mask[y1:y2, x1:x2]
+
+        if torch.sum(RoI) / ( (x2 - x1) * (y2 - y1) ) > 0.5:
+            selected_mask.append(mask)
+    print(len(selected_mask))
+    selected_mask.sort(key=lambda x: x.sum(), reverse=True)
+    selected_mask = torch.stack(selected_mask)
+    if len(selected_mask) < 3:
+        pad_num = 3 - len(selected_mask)
+        selected_mask = torch.cat([
+            selected_mask, selected_mask[[-1]].repeat(pad_num, 1, 1)
+        ], dim=0)
+    else:
+        selected_mask = selected_mask[:3]
+    
+    return selected_mask
+
+def point_sample(all_masks, points_coords, points_label):
+    # all_masks: [N, H, W], one image, N masks
+    # points_coords: (N, 2)
+    # points_label: (N, 1), 1 for foreground, 0 for background
+    # return: sampled_masks: [3, H, W], masks order from big to small
+    # you can modify the signature of this function
+    selected_mask = []
+    for mask in all_masks:
+        points_coords = torch.round(points_coords).int()
+        sampled_point = mask[points_coords[:, 1], points_coords[:, 0]]
+        if torch.all(sampled_point):
+            selected_mask.append(mask)
+    
+    print(len(selected_mask))
+    selected_mask.sort(key=lambda x: x.sum())
+    selected_mask = torch.stack(selected_mask)
+    if len(selected_mask) < 3:
+        pad_num = 3 - len(selected_mask)
+        selected_mask = torch.cat([
+            selected_mask, selected_mask[[-1]].repeat(pad_num, 1, 1)
+        ], dim=0)
+    else:
+        selected_mask = selected_mask[:3]
+    
+    return selected_mask
 
 def compute_loss(pred, gt_mask, alpha = 0.25, gamma = 2):
     h, w = gt_mask.shape[-2:]
@@ -243,7 +295,7 @@ if __name__ == "__main__":
     summary_writer = SummaryWriter(writer_dir)
     
     path = './sa1b'
-    dataset = SA1B_Dataset(root=path, transform=input_transforms, target_transform=target_transforms)
+    dataset = SA1B_Dataset(root=path, transform=input_transforms, is_test=True, target_transform=target_transforms)
     all_index = np.arange(len(dataset))
     # np.random.shuffle(all_index)
     train_num = int(0.8 * len(dataset))
@@ -260,6 +312,28 @@ if __name__ == "__main__":
                                 transform=input_transforms, target_transform=target_transforms)
     test_dataset = SA1bSubsetPoint(test_index, num_points=2, is_test=True, root=path, 
                                 transform=input_transforms, target_transform=target_transforms)
+    
+    img, target, box = dataset[1048]
+    image = input_reverse_transforms(img)
+    image = np.array(image)
+    show_image(image, target, 8, 8)
+    
+    # box_id = box[2]
+    # assign_target = box_sample(target, box_id)
+    # fig, axes = plt.subplots(1, 1, figsize=(6, 6))
+    # image_cpu = img.permute(1, 2, 0)
+    # axes.imshow(image_cpu)
+    # for m in assign_target:
+    #     show_mask(m, axes, random_color=True)
+    
+    # p_y, p_x = torch.where(target[2] > 0)
+    # positive_point = torch.stack([p_x[0], p_y[0]])
+    # positive_point = positive_point.reshape(-1, 2)
+    # points = torch.cat([positive_point, torch.tensor([[50, 80]])])
+    # label = torch.tensor([1., 0.])
+    # show_points(points, label, axes)
+    # plt.axis("off")
+    # fig.savefig("point_assign.png")
     
     # Copy SAM Model
     sam = sam_model_registry["vit_b"](checkpoint="sam_vit_b_01ec64.pth")
